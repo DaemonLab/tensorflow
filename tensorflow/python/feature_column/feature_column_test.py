@@ -772,7 +772,7 @@ class CrossedColumnTest(test.TestCase):
       fc.crossed_column(['a', fc.numeric_column('c')], 10)
 
     with self.assertRaisesRegexp(
-        ValueError, '_HashedCategoricalColumn is not supported'):
+        ValueError, 'categorical_column_with_hash_bucket is not supported'):
       fc.crossed_column(
           ['a', fc.categorical_column_with_hash_bucket('c', 10)], 10)
 
@@ -1507,6 +1507,131 @@ class LinearModelTest(test.TestCase):
                 features['price2']: [[1.], [5.]],
             })
 
+  def test_with_numpy_input_fn(self):
+    price = fc.numeric_column('price')
+    price_buckets = fc.bucketized_column(price, boundaries=[0., 10., 100.,])
+    body_style = fc.categorical_column_with_vocabulary_list(
+        'body-style', vocabulary_list=['hardtop', 'wagon', 'sedan'])
+
+    input_fn = numpy_io.numpy_input_fn(
+        x={
+            'price': np.array([-1., 2., 13., 104.]),
+            'body-style': np.array(['sedan', 'hardtop', 'wagon', 'sedan']),
+        },
+        batch_size=2,
+        shuffle=False)
+    features = input_fn()
+    net = fc.linear_model(features, [price_buckets, body_style])
+    # self.assertEqual(1 + 3 + 5, net.shape[1])
+    with _initialized_session() as sess:
+      coord = coordinator.Coordinator()
+      threads = queue_runner_impl.start_queue_runners(sess, coord=coord)
+
+      bias = get_linear_model_bias()
+      price_buckets_var = get_linear_model_column_var(price_buckets)
+      body_style_var = get_linear_model_column_var(body_style)
+
+      sess.run(price_buckets_var.assign([[10.], [100.], [1000.], [10000.]]))
+      sess.run(body_style_var.assign([[-10.], [-100.], [-1000.]]))
+      sess.run(bias.assign([5.]))
+
+      self.assertAllClose([[10 - 1000 + 5.], [100 - 10 + 5.]], sess.run(net))
+
+      coord.request_stop()
+      coord.join(threads)
+
+  def test_with_1d_sparse_tensor(self):
+    price = fc.numeric_column('price')
+    price_buckets = fc.bucketized_column(price, boundaries=[0., 10., 100.,])
+    body_style = fc.categorical_column_with_vocabulary_list(
+        'body-style', vocabulary_list=['hardtop', 'wagon', 'sedan'])
+
+    # Provides 1-dim tensor and dense tensor.
+    features = {
+        'price': constant_op.constant([-1., 12.,]),
+        'body-style': sparse_tensor.SparseTensor(
+            indices=((0,), (1,)),
+            values=('sedan', 'hardtop'),
+            dense_shape=(2,)),
+    }
+    self.assertEqual(1, features['price'].shape.ndims)
+    self.assertEqual(1, features['body-style'].dense_shape.get_shape()[0])
+
+    net = fc.linear_model(features, [price_buckets, body_style])
+    with _initialized_session() as sess:
+      bias = get_linear_model_bias()
+      price_buckets_var = get_linear_model_column_var(price_buckets)
+      body_style_var = get_linear_model_column_var(body_style)
+
+      sess.run(price_buckets_var.assign([[10.], [100.], [1000.], [10000.]]))
+      sess.run(body_style_var.assign([[-10.], [-100.], [-1000.]]))
+      sess.run(bias.assign([5.]))
+
+      self.assertAllClose([[10 - 1000 + 5.], [1000 - 10 + 5.]], sess.run(net))
+
+  def test_with_1d_unknown_shape_sparse_tensor(self):
+    price = fc.numeric_column('price')
+    price_buckets = fc.bucketized_column(price, boundaries=[0., 10., 100.,])
+    body_style = fc.categorical_column_with_vocabulary_list(
+        'body-style', vocabulary_list=['hardtop', 'wagon', 'sedan'])
+    country = fc.categorical_column_with_vocabulary_list(
+        'country', vocabulary_list=['US', 'JP', 'CA'])
+
+    # Provides 1-dim tensor and dense tensor.
+    features = {
+        'price': array_ops.placeholder(dtypes.float32),
+        'body-style': array_ops.sparse_placeholder(dtypes.string),
+        'country': array_ops.placeholder(dtypes.string),
+    }
+    self.assertIsNone(features['price'].shape.ndims)
+    self.assertIsNone(features['body-style'].get_shape().ndims)
+
+    price_data = np.array([-1., 12.])
+    body_style_data = sparse_tensor.SparseTensorValue(
+        indices=((0,), (1,)),
+        values=('sedan', 'hardtop'),
+        dense_shape=(2,))
+
+    net = fc.linear_model(features, [price_buckets, body_style])
+    bias = get_linear_model_bias()
+    price_buckets_var = get_linear_model_column_var(price_buckets)
+    body_style_var = get_linear_model_column_var(body_style)
+    with _initialized_session() as sess:
+      sess.run(price_buckets_var.assign([[10.], [100.], [1000.], [10000.]]))
+      sess.run(body_style_var.assign([[-10.], [-100.], [-1000.]]))
+      sess.run(bias.assign([5.]))
+
+      self.assertAllClose(
+          [[10 - 1000 + 5.], [1000 - 10 + 5.]],
+          sess.run(net, feed_dict={
+              features['price']: price_data,
+              features['body-style']: body_style_data}))
+
+    # Dense categorical_column with unknown shape is not allowed.
+    with self.assertRaisesRegexp(ValueError, 'Undefined input_tensor shape.'):
+      fc.linear_model(features, [price_buckets, body_style, country])
+
+  def test_with_rank_0_feature(self):
+    price = fc.numeric_column('price')
+    features = {
+        'price': constant_op.constant(0),
+    }
+    self.assertEqual(0, features['price'].shape.ndims)
+
+    # Static rank 0 should fail
+    with self.assertRaisesRegexp(ValueError, 'Feature .* cannot have rank 0'):
+      fc.linear_model(features, [price])
+
+    # Dynamic rank 0 should fail
+    features = {
+        'price': array_ops.placeholder(dtypes.float32),
+    }
+    net = fc.linear_model(features, [price])
+    self.assertEqual(1, net.shape[1])
+    with _initialized_session() as sess:
+      with self.assertRaisesOpError('Feature .* cannot have rank 0'):
+        sess.run(net, feed_dict={features['price']: np.array(1)})
+
 
 class InputLayerTest(test.TestCase):
 
@@ -1528,6 +1653,21 @@ class InputLayerTest(test.TestCase):
         ValueError, 'Expected feature_columns to be iterable, found dict.'):
       fc.input_layer(
           features={'a': [[0]]}, feature_columns={'a': fc.numeric_column('a')})
+
+  def test_bare_column(self):
+    with ops.Graph().as_default():
+      features = features = {'a': [0.]}
+      net = fc.input_layer(features, fc.numeric_column('a'))
+      with _initialized_session():
+        self.assertAllClose([[0.]], net.eval())
+
+  def test_column_generator(self):
+    with ops.Graph().as_default():
+      features = features = {'a': [0.], 'b': [1.]}
+      columns = (fc.numeric_column(key) for key in features)
+      net = fc.input_layer(features, columns)
+      with _initialized_session():
+        self.assertAllClose([[0., 1.]], net.eval())
 
   def test_raises_if_duplicate_name(self):
     with self.assertRaisesRegexp(
@@ -1817,6 +1957,28 @@ class InputLayerTest(test.TestCase):
           sess.run(net, feed_dict={
               features['price']: price_data,
               features['body-style']: body_style_data}))
+
+  def test_with_rank_0_feature(self):
+    # price has 1 dimension in input_layer
+    price = fc.numeric_column('price')
+    features = {
+        'price': constant_op.constant(0),
+    }
+    self.assertEqual(0, features['price'].shape.ndims)
+
+    # Static rank 0 should fail
+    with self.assertRaisesRegexp(ValueError, 'Feature .* cannot have rank 0'):
+      fc.input_layer(features, [price])
+
+    # Dynamic rank 0 should fail
+    features = {
+        'price': array_ops.placeholder(dtypes.float32),
+    }
+    net = fc.input_layer(features, [price])
+    self.assertEqual(1, net.shape[1])
+    with _initialized_session() as sess:
+      with self.assertRaisesOpError('Feature .* cannot have rank 0'):
+        sess.run(net, feed_dict={features['price']: np.array(1)})
 
 
 class MakeParseExampleSpecTest(test.TestCase):
@@ -2388,6 +2550,21 @@ class VocabularyListCategoricalColumnTest(test.TestCase):
       fc.categorical_column_with_vocabulary_list(
           key='aaa', vocabulary_list=(12, 24, 12))
 
+  def test_invalid_num_oov_buckets(self):
+    with self.assertRaisesRegexp(ValueError, 'Invalid num_oov_buckets'):
+      fc.categorical_column_with_vocabulary_list(
+          key='aaa', vocabulary_list=(12, 24, 36),
+          num_oov_buckets=-1)
+
+  def test_invalid_buckets_and_default_value(self):
+    with self.assertRaisesRegexp(
+        ValueError, 'both num_oov_buckets and default_value'):
+      fc.categorical_column_with_vocabulary_list(
+          key='aaa',
+          vocabulary_list=(12, 24, 36),
+          num_oov_buckets=100,
+          default_value=2)
+
   def test_invalid_input_dtype_int32(self):
     column = fc.categorical_column_with_vocabulary_list(
         key='aaa',
@@ -2546,6 +2723,26 @@ class VocabularyListCategoricalColumnTest(test.TestCase):
               dense_shape=inputs.dense_shape),
           id_weight_pair.id_tensor.eval())
 
+  def test_get_sparse_tensors_with_oov_buckets(self):
+    column = fc.categorical_column_with_vocabulary_list(
+        key='aaa',
+        vocabulary_list=('omar', 'stringer', 'marlo'),
+        num_oov_buckets=100)
+    inputs = sparse_tensor.SparseTensorValue(
+        indices=((0, 0), (1, 0), (1, 1), (1, 2)),
+        values=('marlo', 'skywalker', 'omar', 'heisenberg'),
+        dense_shape=(2, 3))
+    id_weight_pair = column._get_sparse_tensors(_LazyBuilder({'aaa': inputs}))
+    self.assertIsNone(id_weight_pair.weight_tensor)
+    with _initialized_session():
+      _assert_sparse_tensor_value(
+          self,
+          sparse_tensor.SparseTensorValue(
+              indices=inputs.indices,
+              values=np.array((2, 33, 0, 62), dtype=np.int64),
+              dense_shape=inputs.dense_shape),
+          id_weight_pair.id_tensor.eval())
+
   def test_get_sparse_tensors_int32(self):
     column = fc.categorical_column_with_vocabulary_list(
         key='aaa',
@@ -2589,11 +2786,33 @@ class VocabularyListCategoricalColumnTest(test.TestCase):
               dense_shape=(3, 3)),
           id_weight_pair.id_tensor.eval())
 
+  def test_get_sparse_tensors_int32_with_oov_buckets(self):
+    column = fc.categorical_column_with_vocabulary_list(
+        key='aaa',
+        vocabulary_list=np.array((30, 35, 11, 23, 22), dtype=np.int32),
+        dtype=dtypes.int32,
+        num_oov_buckets=100)
+    inputs = sparse_tensor.SparseTensorValue(
+        indices=((0, 0), (1, 0), (1, 1), (2, 2)),
+        values=(11, 100, 30, 22),
+        dense_shape=(3, 3))
+    id_weight_pair = column._get_sparse_tensors(_LazyBuilder({'aaa': inputs}))
+    self.assertIsNone(id_weight_pair.weight_tensor)
+    with _initialized_session():
+      _assert_sparse_tensor_value(
+          self,
+          sparse_tensor.SparseTensorValue(
+              indices=inputs.indices,
+              values=np.array((2, 60, 0, 4), dtype=np.int64),
+              dense_shape=inputs.dense_shape),
+          id_weight_pair.id_tensor.eval())
+
   def test_linear_model(self):
     wire_column = fc.categorical_column_with_vocabulary_list(
         key='aaa',
-        vocabulary_list=('omar', 'stringer', 'marlo'))
-    self.assertEqual(3, wire_column._num_buckets)
+        vocabulary_list=('omar', 'stringer', 'marlo'),
+        num_oov_buckets=1)
+    self.assertEqual(4, wire_column._num_buckets)
     with ops.Graph().as_default():
       predictions = fc.linear_model({
           wire_column.name: sparse_tensor.SparseTensorValue(
@@ -2605,12 +2824,12 @@ class VocabularyListCategoricalColumnTest(test.TestCase):
       wire_var = get_linear_model_column_var(wire_column)
       with _initialized_session():
         self.assertAllClose((0.,), bias.eval())
-        self.assertAllClose(((0.,), (0.,), (0.,)), wire_var.eval())
+        self.assertAllClose(((0.,), (0.,), (0.,), (0.,)), wire_var.eval())
         self.assertAllClose(((0.,), (0.,)), predictions.eval())
-        wire_var.assign(((1.,), (2.,), (3.,))).eval()
+        wire_var.assign(((1.,), (2.,), (3.,), (4.,))).eval()
         # 'marlo' -> 2: wire_var[2] = 3
-        # 'skywalker' -> None, 'omar' -> 0: wire_var[0] = 1
-        self.assertAllClose(((3.,), (1.,)), predictions.eval())
+        # 'skywalker' -> 3, 'omar' -> 0: wire_var[3] + wire_var[0] = 4+1 = 5
+        self.assertAllClose(((3.,), (5.,)), predictions.eval())
 
 
 class IdentityCategoricalColumnTest(test.TestCase):
@@ -3001,6 +3220,46 @@ class IndicatorColumnTest(test.TestCase):
     indicator_tensor = _transform_features(features, [a_indicator])[a_indicator]
     with _initialized_session():
       self.assertAllEqual([[0, 0, 1], [1, 0, 0]], indicator_tensor.eval())
+
+  def test_transform_with_weighted_column(self):
+    # Github issue 12557
+    ids = fc.categorical_column_with_vocabulary_list(
+      key='ids', vocabulary_list=('a', 'b', 'c'))
+    weights = fc.weighted_categorical_column(ids, 'weights')
+    indicator = fc.indicator_column(weights)
+    features = {
+        'ids': constant_op.constant([['c', 'b', 'a']]),
+        'weights': constant_op.constant([[2., 4., 6.]])
+    }
+    indicator_tensor = _transform_features(features, [indicator])[indicator]
+    with _initialized_session():
+      self.assertAllEqual([[6., 4., 2.]], indicator_tensor.eval())
+
+  def test_transform_with_missing_value_in_weighted_column(self):
+    # Github issue 12583
+    ids = fc.categorical_column_with_vocabulary_list(
+        key='ids', vocabulary_list=('a', 'b', 'c'))
+    weights = fc.weighted_categorical_column(ids, 'weights')
+    indicator = fc.indicator_column(weights)
+    features = {
+        'ids': constant_op.constant([['c', 'b', 'unknown']]),
+        'weights': constant_op.constant([[2., 4., 6.]])
+    }
+    indicator_tensor = _transform_features(features, [indicator])[indicator]
+    with _initialized_session():
+      self.assertAllEqual([[0., 4., 2.]], indicator_tensor.eval())
+
+  def test_transform_with_missing_value_in_categorical_column(self):
+    # Github issue 12583
+    ids = fc.categorical_column_with_vocabulary_list(
+        key='ids', vocabulary_list=('a', 'b', 'c'))
+    indicator = fc.indicator_column(ids)
+    features = {
+        'ids': constant_op.constant([['c', 'b', 'unknown']]),
+    }
+    indicator_tensor = _transform_features(features, [indicator])[indicator]
+    with _initialized_session():
+      self.assertAllEqual([[0., 1., 1.]], indicator_tensor.eval())
 
   def test_linear_model(self):
     animal = fc.indicator_column(

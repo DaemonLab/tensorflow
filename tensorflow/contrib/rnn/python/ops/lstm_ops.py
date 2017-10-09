@@ -20,7 +20,6 @@ from __future__ import print_function
 import abc
 
 from tensorflow.contrib.rnn.ops import gen_lstm_ops
-from tensorflow.contrib.rnn.python.ops import core_rnn_cell
 from tensorflow.contrib.rnn.python.ops import fused_rnn_cell
 from tensorflow.contrib.util import loader
 from tensorflow.python.framework import dtypes
@@ -29,6 +28,7 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops import rnn_cell_impl
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.platform import resource_loader
 
@@ -58,7 +58,7 @@ def _lstm_block_cell(x,
 
   ```python
   xh = [x, h_prev]
-  [i, f, ci, o] = xh * w + b
+  [i, ci, f, o] = xh * w + b
   f = f + forget_bias
 
   if not use_peephole:
@@ -92,8 +92,8 @@ def _lstm_block_cell(x,
     wco: A `Tensor`. Must have the same type as `x`.
       The weight matrix for output gate peephole connection.
     forget_bias: An optional `float`. Defaults to `1`. The forget gate bias.
-    cell_clip: An optional `float`. Defaults to `3`.
-      Value to clip the 'cs' value to.
+    cell_clip: An optional `float`. Defaults to `-1` (no clipping).
+      Value to clip the 'cs' value to. Disable by setting to negative value.
     use_peephole: An optional `bool`. Defaults to `False`.
       Whether to use peephole weights.
     name: A name for the operation (optional).
@@ -130,7 +130,7 @@ def _lstm_block_cell(x,
       wcf=wcf,
       b=b,
       forget_bias=forget_bias,
-      cell_clip=cell_clip,
+      cell_clip=cell_clip if cell_clip is not None else -1,
       use_peephole=use_peephole,
       name=name)
   # pylint: enable=protected-access
@@ -162,7 +162,7 @@ def _block_lstm(seq_len_max,
     wcf: A `Tensor`. Must have the same type as `x`.
     wco: A `Tensor`. Must have the same type as `x`.
     forget_bias: An optional `float`. Defaults to `1`.
-    cell_clip: An optional `float`. Defaults to `3`.
+    cell_clip: An optional `float`. Defaults to `-1` (no clipping).
     use_peephole: An optional `bool`. Defaults to `False`.
     name: A name for the operation (optional).
 
@@ -216,7 +216,7 @@ def _block_lstm(seq_len_max,
       wcf=wcf,
       b=b,
       forget_bias=forget_bias,
-      cell_clip=cell_clip,
+      cell_clip=cell_clip if cell_clip is not None else -1,
       name=name,
       use_peephole=use_peephole)
 
@@ -325,7 +325,7 @@ def _BlockLSTMGrad(op, *grad):
           wcf_grad, b_grad]
 
 
-class LSTMBlockCell(core_rnn_cell.RNNCell):
+class LSTMBlockCell(rnn_cell_impl.RNNCell):
   """Basic LSTM recurrent network cell.
 
   The implementation is based on: http://arxiv.org/abs/1409.2329.
@@ -333,7 +333,7 @@ class LSTMBlockCell(core_rnn_cell.RNNCell):
   We add `forget_bias` (default: 1) to the biases of the forget gate in order to
   reduce the scale of forgetting in the beginning of the training.
 
-  Unlike `core_rnn_cell.LSTMCell`, this is a monolithic op and should be much
+  Unlike `rnn_cell_impl.LSTMCell`, this is a monolithic op and should be much
   faster.  The weight and bias matrices should be compatible as long as the
   variable scope matches.
   """
@@ -341,17 +341,28 @@ class LSTMBlockCell(core_rnn_cell.RNNCell):
   def __init__(self,
                num_units,
                forget_bias=1.0,
-               use_peephole=False):
+               cell_clip=None,
+               use_peephole=False,
+               reuse=None):
     """Initialize the basic LSTM cell.
 
     Args:
       num_units: int, The number of units in the LSTM cell.
       forget_bias: float, The bias added to forget gates (see above).
+      cell_clip: An optional `float`. Defaults to `-1` (no clipping).
       use_peephole: Whether to use peephole connections or not.
+      reuse: (optional) boolean describing whether to reuse variables in an
+        existing scope.  If not `True`, and the existing scope already has the
+        given variables, an error is raised.
+
+      When restoring from CudnnLSTM-trained checkpoints, must use
+      CudnnCompatibleLSTMBlockCell instead.
     """
+    super(LSTMBlockCell, self).__init__(_reuse=reuse)
     self._num_units = num_units
     self._forget_bias = forget_bias
     self._use_peephole = use_peephole
+    self._cell_clip = cell_clip if cell_clip is not None else -1
     self._names = {
         "W": "kernel",
         "b": "bias",
@@ -363,7 +374,7 @@ class LSTMBlockCell(core_rnn_cell.RNNCell):
 
   @property
   def state_size(self):
-    return core_rnn_cell.LSTMStateTuple(self._num_units, self._num_units)
+    return rnn_cell_impl.LSTMStateTuple(self._num_units, self._num_units)
 
   @property
   def output_size(self):
@@ -400,9 +411,10 @@ class LSTMBlockCell(core_rnn_cell.RNNCell):
           wco=wco,
           wcf=wcf,
           forget_bias=self._forget_bias,
+          cell_clip=self._cell_clip,
           use_peephole=self._use_peephole)
 
-      new_state = core_rnn_cell.LSTMStateTuple(cs, h)
+      new_state = rnn_cell_impl.LSTMStateTuple(cs, h)
       return h, new_state
 
 
@@ -546,8 +558,7 @@ class LSTMBlockWrapper(fused_rnn_cell.FusedRNNCell):
         # Input was a list, so return a list
         outputs = array_ops.unstack(outputs)
 
-      final_state = core_rnn_cell.LSTMStateTuple(final_cell_state,
-                                                 final_output)
+      final_state = rnn_cell_impl.LSTMStateTuple(final_cell_state, final_output)
       return outputs, final_state
 
   def _gather_states(self, data, indices, batch_size):
@@ -569,7 +580,7 @@ class LSTMBlockFusedCell(LSTMBlockWrapper):
   We add forget_bias (default: 1) to the biases of the forget gate in order to
   reduce the scale of forgetting in the beginning of the training.
 
-  The variable naming is consistent with `core_rnn_cell.LSTMCell`.
+  The variable naming is consistent with `rnn_cell_impl.LSTMCell`.
   """
 
   def __init__(self,
@@ -582,12 +593,12 @@ class LSTMBlockFusedCell(LSTMBlockWrapper):
     Args:
       num_units: int, The number of units in the LSTM cell.
       forget_bias: float, The bias added to forget gates (see above).
-      cell_clip: clip the cell to this value. Defaults to `3`.
+      cell_clip: clip the cell to this value. Default is no cell clipping.
       use_peephole: Whether to use peephole connections or not.
     """
     self._num_units = num_units
     self._forget_bias = forget_bias
-    self._cell_clip = cell_clip
+    self._cell_clip = cell_clip if cell_clip is not None else -1
     self._use_peephole = use_peephole
 
   @property

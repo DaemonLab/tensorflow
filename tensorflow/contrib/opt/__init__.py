@@ -30,7 +30,9 @@ from tensorflow.contrib.opt.python.training.variable_clipping_optimizer import *
 
 from tensorflow.python.util.all_util import remove_undocumented
 
+
 _allowed_symbols = [
+    'DelayCompensatedGradientDescentOptimizer',
     'DropStaleGradientOptimizer', 'ExternalOptimizerInterface',
     'LazyAdamOptimizer', 'NadamOptimizer', 'MovingAverageOptimizer',
     'ScipyOptimizerInterface', 'VariableClippingOptimizer'

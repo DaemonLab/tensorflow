@@ -29,6 +29,7 @@ See the @{$python/check_ops} guide.
 @@assert_greater_equal
 @@assert_rank
 @@assert_rank_at_least
+@@assert_rank_in
 @@assert_type
 @@assert_integer
 @@assert_proper_iterable
@@ -45,6 +46,7 @@ from __future__ import print_function
 
 import numpy as np
 
+from tensorflow.python.eager import context
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
@@ -726,7 +728,7 @@ def _assert_ranks_condition(
 
   # Attempt to statically defined rank.
   ranks_static = tuple([tensor_util.constant_value(rank) for rank in ranks])
-  if None not in ranks_static:
+  if not any(r is None for r in ranks_static):
     for rank_static in ranks_static:
       if rank_static.ndim != 0:
         raise ValueError('Rank must be a scalar.')
@@ -860,8 +862,12 @@ def assert_type(tensor, tf_type, message=None, name=None):
   with ops.name_scope(name, 'assert_type', [tensor]):
     tensor = ops.convert_to_tensor(tensor, name='tensor')
     if tensor.dtype != tf_type:
-      raise TypeError(
-          '%s  %s must be of type %s' % (message, tensor.op.name, tf_type))
+      if context.in_graph_mode():
+        raise TypeError(
+            '%s  %s must be of type %s' % (message, tensor.name, tf_type))
+      else:
+        raise TypeError(
+            '%s tensor must be of type %s' % (message, tf_type))
 
     return control_flow_ops.no_op('statically_determined_correct_type')
 

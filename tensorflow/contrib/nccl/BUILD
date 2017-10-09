@@ -48,6 +48,8 @@ tf_cuda_cc_test(
     # Disabled on jenkins until errors finding nvmlShutdown are found.
     tags = [
         "manual",
+        "no_oss",
+        "noguitar",  # note: is run manually there
         "notap",
     ],
     deps = if_cuda(
@@ -127,6 +129,8 @@ cuda_py_test(
     # Disabled on jenkins until errors finding nvmlShutdown are found.
     tags = [
         "manual",
+        "no_oss",
+        "noguitar",  # note: is run manually there
         "notap",
     ],
 )
